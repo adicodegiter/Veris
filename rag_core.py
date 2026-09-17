@@ -33,6 +33,77 @@ def _chat(messages):
         response = ollama.chat(model="llama3.2:3b", messages=messages)
         return response["message"]["content"]
 
+def validate_answer(answer, context):
+    validation_prompt = f"""You are a strict fact-checker. Check whether the ANSWER is fully supported by the CONTEXT.
+
+CONTEXT:
+{context}
+
+ANSWER TO CHECK:
+{answer}
+
+Instructions:
+- Check every claim in the ANSWER against the CONTEXT only.
+- A claim is UNSUPPORTED if it's not directly stated or clearly implied by the CONTEXT.
+- Respond in EXACTLY this format, nothing else:
+
+VERDICT: [SUPPORTED / PARTIALLY_SUPPORTED / UNSUPPORTED]
+UNSUPPORTED_CLAIMS: [list specific unsupported claims, or "None"]
+REASONING: [one sentence]"""
+    return _chat([{"role": "user", "content": validation_prompt}])
+
+def ask_question(question):
+    if collection.count() == 0:
+        return {
+            "answer": "I don't have any documents to answer from.",
+            "validation": "VERDICT: N/A (no documents have been absorbed)",
+            "sources": [],
+        }
+
+    results = collection.query(
+        query_texts=[question],
+        n_results=collection.count(),
+        include=["documents", "distances"],
+    )
+    retrieved_chunks = results["documents"][0]
+    distances = results["distances"][0]
+    question_terms = {
+        term
+        for term in re.findall(r"[a-zA-Z][a-zA-Z+#.-]*", question.lower())
+        if term not in STOP_WORDS
+    }
+    filtered = [
+        (chunk, distance)
+        for chunk, distance in zip(retrieved_chunks, distances)
+        if distance <= DISTANCE_THRESHOLD
+        or any(
+            re.search(rf"(?<![a-z]){re.escape(term)}(?![a-z])", chunk.lower())
+            for term in question_terms
+        )
+    ]
+
+    if not filtered:
+        return {
+            "answer": "I don't have relevant information in your documents to answer this.",
+            "validation": "VERDICT: SUPPORTED (model correctly declined to answer)",
+            "sources": [],
+        }
+
+    context = "\n\n".join(chunk for chunk, _ in filtered)
+    prompt = f"""Answer the question using ONLY the context below. If the answer isn't in the context, say "I don't know based on the provided documents."\n\nContext:\n{context}\n\nQuestion: {question}\n\nAnswer:"""
+    answer = _chat([{"role": "user", "content": prompt}])
+
+    if "don't know" in answer.lower() or "cannot" in answer.lower() or "no relevant" in answer.lower():
+        validation = "VERDICT: SUPPORTED (model correctly declined to answer)"
+    else:
+        validation = validate_answer(answer, context)
+
+    return {
+        "answer": answer,
+        "validation": validation,
+        "sources": [chunk for chunk, _ in filtered],
+    }
+
 def ingest_pdf(filepath, doc_id_prefix="doc"):
     reader = PdfReader(filepath)
     full_text = ""

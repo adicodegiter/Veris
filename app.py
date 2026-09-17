@@ -13,7 +13,7 @@ with st.sidebar:
     st.header("Upload Documents")
     uploaded_file = st.file_uploader("Choose a PDF", type="pdf")
     if uploaded_file is not None:
-        if st.button("Ingest document"):
+        if st.button("Absorb document"):
             with st.spinner("Reading and embedding document..."):
                 files = {"file": (uploaded_file.name, uploaded_file.getvalue(), "application/pdf")}
                 response = requests.post(f"{API_URL}/absorb", files=files)
@@ -21,7 +21,7 @@ with st.sidebar:
                     result = response.json()
                     st.success(f"Added {result['chunks_added']} chunks from {result['filename']}")
                 else:
-                    st.error("Failed to ingest document.")
+                    st.error("Failed to absorb document.")
 
 # --- Main: chat interface ---
 if "history" not in st.session_state:
@@ -31,9 +31,15 @@ question = st.chat_input("Ask a question about your documents...")
 
 if question:
     with st.spinner("Thinking..."):
-        response = requests.post(f"{API_URL}/ask", json={"question": question})
-        result = response.json()
-        st.session_state.history.append({"question": question, "result": result})
+        try:
+            response = requests.post(f"{API_URL}/ask", json={"question": question}, timeout=60)
+            response.raise_for_status()
+            result = response.json()
+            st.session_state.history.append({"question": question, "result": result})
+        except requests.RequestException as error:
+            st.error(f"The API request failed: {error}")
+        except ValueError:
+            st.error(f"The API returned an invalid response: {response.text[:500]}")
 
 # Display conversation history, most recent first
 for entry in reversed(st.session_state.history):
