@@ -2,7 +2,12 @@ import streamlit as st
 import requests
 import os
 
-API_URL = "http://127.0.0.1:8001"
+try:
+    secret_api_url = st.secrets.get("API_URL")
+except Exception:
+    secret_api_url = None
+
+API_URL = (os.getenv("API_URL") or secret_api_url or "http://127.0.0.1:8001").rstrip("/")
 
 st.set_page_config(page_title="Veris", page_icon="🔍")
 st.title("🔍 Veris")

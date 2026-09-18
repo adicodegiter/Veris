@@ -8,6 +8,10 @@ app = FastAPI(title="Veris API")
 class Question(BaseModel):
     question: str
 
+@app.get("/health")
+def health():
+    return {"status": "ok"}
+
 @app.post("/ask")
 def ask(payload: Question):
     return rag_core.ask_question(payload.question)
