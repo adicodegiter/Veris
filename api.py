@@ -1,4 +1,4 @@
-from fastapi import FastAPI, UploadFile
+from fastapi import FastAPI, UploadFile, Form
 from pydantic import BaseModel
 import shutil
 import rag_core
@@ -7,19 +7,16 @@ app = FastAPI(title="Veris API")
 
 class Question(BaseModel):
     question: str
-
-@app.get("/health")
-def health():
-    return {"status": "ok"}
+    session_id: str
 
 @app.post("/ask")
 def ask(payload: Question):
-    return rag_core.ask_question(payload.question)
+    return rag_core.ask_question(payload.question, payload.session_id)
 
 @app.post("/absorb")
-def absorb(file: UploadFile):
-    filepath = f"./{file.filename}"
+def absorb(file: UploadFile, session_id: str = Form(...)):
+    filepath = f"./{session_id}_{file.filename}"
     with open(filepath, "wb") as f:
         shutil.copyfileobj(file.file, f)
-    num_chunks = rag_core.ingest_pdf(filepath, doc_id_prefix=file.filename)
+    num_chunks = rag_core.ingest_pdf(filepath, session_id, doc_id_prefix=file.filename)
     return {"filename": file.filename, "chunks_added": num_chunks}
