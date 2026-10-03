@@ -1,44 +1,85 @@
 import os
 import re
+import hashlib
+import io
+import time
+import zipfile
+import xml.etree.ElementTree as ET
 from pypdf import PdfReader
 import chromadb
-import ollama
 from dotenv import load_dotenv
 from groq import Groq
+from streamlit.errors import StreamlitSecretNotFoundError
 
 load_dotenv()
 
 DISTANCE_THRESHOLD = 1.5
 GROQ_API_KEY = os.environ.get("GROQ_API_KEY")
+if not GROQ_API_KEY:
+    try:
+        import streamlit as st
+
+        GROQ_API_KEY = st.secrets.get("GROQ_API_KEY")
+    except StreamlitSecretNotFoundError:
+        pass
 USE_GROQ = bool(GROQ_API_KEY)
 
 if USE_GROQ:
     groq_client = Groq(api_key=GROQ_API_KEY)
     GROQ_MODEL = "openai/gpt-oss-20b"
 
-client = chromadb.PersistentClient(path="./chroma_db")
+client = chromadb.EphemeralClient()
+SESSION_TTL_SECONDS = 60 * 60
 
 STOP_WORDS = {"a", "am", "are", "do", "does", "i", "is", "know", "me", "my", "the", "what", "which", "with", "you"}
 
 def _get_collection(session_id):
-    """Each visitor gets their own isolated document collection, keyed by session_id."""
-    return client.get_or_create_collection(name=f"session_{session_id}")
+    """Return this session's in-memory collection and expire inactive sessions."""
+    now = time.time()
+    for collection in client.list_collections():
+        if not collection.name.startswith("session_"):
+            continue
+        last_accessed = (collection.metadata or {}).get("last_accessed", now)
+        if now - float(last_accessed) > SESSION_TTL_SECONDS:
+            client.delete_collection(name=collection.name)
+
+    collection = client.get_or_create_collection(
+        name=f"session_{session_id}",
+        metadata={"last_accessed": now},
+    )
+    collection.modify(metadata={"last_accessed": now})
+    return collection
 
 def _chat(messages):
-    if USE_GROQ:
-        response = groq_client.chat.completions.create(model=GROQ_MODEL, messages=messages)
-        return response.choices[0].message.content
-    else:
-        response = ollama.chat(model="llama3.2:3b", messages=messages)
-        return response["message"]["content"]
+    if not USE_GROQ:
+        raise RuntimeError(
+            "The hosted LLM is not configured. Add GROQ_API_KEY to the app's secrets."
+        )
+    response = groq_client.chat.completions.create(model=GROQ_MODEL, messages=messages)
+    return response.choices[0].message.content
 
-def ingest_pdf(filepath, session_id, doc_id_prefix="doc"):
+def _extract_document_text(file_bytes, extension):
+    extension = extension.lower()
+    if extension == ".pdf":
+        reader = PdfReader(io.BytesIO(file_bytes))
+        full_text = "\n".join(page.extract_text() or "" for page in reader.pages)
+    elif extension == ".docx":
+        with zipfile.ZipFile(io.BytesIO(file_bytes)) as document:
+            root = ET.fromstring(document.read("word/document.xml"))
+        full_text = " ".join(
+            element.text or "" for element in root.iter()
+            if element.tag.endswith("}t")
+        )
+    elif extension in {".txt", ".md"}:
+        full_text = file_bytes.decode("utf-8-sig", errors="replace")
+    else:
+        raise ValueError(f"Unsupported document type: {extension}")
+    return re.sub(r'(?<=[a-z])(?=[A-Z])', ' ', full_text)
+
+def ingest_document_bytes(file_bytes, session_id, doc_id_prefix="doc"):
     collection = _get_collection(session_id)
-    reader = PdfReader(filepath)
-    full_text = ""
-    for page in reader.pages:
-        full_text += page.extract_text() + "\n"
-    full_text = re.sub(r'(?<=[a-z])(?=[A-Z])', ' ', full_text)
+    extension = os.path.splitext(doc_id_prefix)[1].lower()
+    full_text = _extract_document_text(file_bytes, extension)
 
     chunks = _chunk_text(full_text)
 
@@ -48,12 +89,48 @@ def ingest_pdf(filepath, session_id, doc_id_prefix="doc"):
     filename_chunk = f"Document filename: {doc_id_prefix}"
     chunks = [filename_chunk] + chunks
 
-    existing_count = collection.count()
+    stored = collection.get(include=["documents", "metadatas"])
+    old_ids = []
+    for stored_id, stored_text, metadata in zip(
+        stored["ids"], stored["documents"], stored["metadatas"]
+    ):
+        source = metadata.get("source") if metadata else None
+        if source == doc_id_prefix or (
+            source is None
+            and stored_text == f"Document filename: {doc_id_prefix}"
+        ):
+            old_ids.append(stored_id)
+
+    if old_ids:
+        collection.delete(ids=old_ids)
+
+    document_key = hashlib.sha256(doc_id_prefix.encode("utf-8")).hexdigest()[:20]
     collection.add(
         documents=chunks,
-        ids=[f"{doc_id_prefix}_{existing_count + i}" for i in range(len(chunks))]
+        ids=[f"{document_key}_{i}" for i in range(len(chunks))],
+        metadatas=[{"source": doc_id_prefix} for _ in chunks],
     )
     return len(chunks)
+
+def ingest_document(filepath, session_id, doc_id_prefix="doc"):
+    with open(filepath, "rb") as document:
+        file_bytes = document.read()
+    return ingest_document_bytes(file_bytes, session_id, doc_id_prefix)
+
+def ingest_pdf(filepath, session_id, doc_id_prefix="doc"):
+    return ingest_document(filepath, session_id, doc_id_prefix)
+
+def list_documents(session_id):
+    collection = _get_collection(session_id)
+    stored = collection.get(include=["documents", "metadatas"])
+    filenames = set()
+    for document, metadata in zip(stored["documents"], stored["metadatas"]):
+        source = metadata.get("source") if metadata else None
+        if source:
+            filenames.add(source)
+        elif document.startswith("Document filename: "):
+            filenames.add(document.removeprefix("Document filename: "))
+    return sorted(filenames, key=str.casefold)
 
 def _chunk_text(text, chunk_size=500, overlap=50):
     words = text.split()
@@ -94,6 +171,29 @@ VERDICT: [SUPPORTED / PARTIALLY_SUPPORTED / UNSUPPORTED]
 UNSUPPORTED_CLAIMS: [list specific unsupported claims, or "None"]
 REASONING: [one sentence]"""
     return _chat([{"role": "user", "content": validation_prompt}])
+
+def _is_supported(validation):
+    verdict = re.search(r"^\s*VERDICT:\s*(\w+)", validation, re.IGNORECASE | re.MULTILINE)
+    return verdict is not None and verdict.group(1).upper() == "SUPPORTED"
+
+def _revise_answer(question, answer, context, validation):
+    revision_prompt = f"""Rewrite the ANSWER to address the QUESTION using only facts explicitly present in the CONTEXT.
+Remove every claim identified as unsupported. Do not add general knowledge, implications, or advice.
+If the context does not contain enough information, say that you don't know based on the provided documents.
+Return only the revised answer.
+
+CONTEXT:
+{context}
+
+QUESTION:
+{question}
+
+ANSWER TO REVISE:
+{answer}
+
+VALIDATION FEEDBACK:
+{validation}"""
+    return _chat([{"role": "user", "content": revision_prompt}])
 
 def ask_question(question, session_id):
     collection = _get_collection(session_id)
@@ -144,6 +244,19 @@ Answer:"""
         validation = "SUPPORTED (model correctly declined to answer)"
     else:
         validation = _validate_answer(answer_text, context)
+        if not _is_supported(validation):
+            answer_text = _revise_answer(question, answer_text, context, validation)
+            if "don't know" in answer_text.lower() or "cannot" in answer_text.lower() or "no relevant" in answer_text.lower():
+                validation = "SUPPORTED (model correctly declined to answer)"
+            else:
+                validation = _validate_answer(answer_text, context)
+                if not _is_supported(validation):
+                    answer_text = "I couldn't produce an answer fully supported by your documents. Try rephrasing the question or uploading relevant material."
+                    validation = (
+                        "VERDICT: UNSUPPORTED\n"
+                        "UNSUPPORTED_CLAIMS: The revised answer did not pass verification.\n"
+                        "REASONING: The answer was withheld to avoid presenting unsupported information."
+                    )
 
     return {
         "answer": answer_text,
