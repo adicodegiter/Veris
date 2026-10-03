@@ -14,19 +14,9 @@ from streamlit.errors import StreamlitSecretNotFoundError
 load_dotenv()
 
 DISTANCE_THRESHOLD = 1.5
-GROQ_API_KEY = os.environ.get("GROQ_API_KEY")
-if not GROQ_API_KEY:
-    try:
-        import streamlit as st
-
-        GROQ_API_KEY = st.secrets.get("GROQ_API_KEY")
-    except StreamlitSecretNotFoundError:
-        pass
-USE_GROQ = bool(GROQ_API_KEY)
-
-if USE_GROQ:
-    groq_client = Groq(api_key=GROQ_API_KEY)
-    GROQ_MODEL = "openai/gpt-oss-20b"
+GROQ_MODEL = "openai/gpt-oss-20b"
+groq_client = None
+groq_client_key = None
 
 client = chromadb.EphemeralClient()
 SESSION_TTL_SECONDS = 60 * 60
@@ -50,12 +40,31 @@ def _get_collection(session_id):
     collection.modify(metadata={"last_accessed": now})
     return collection
 
-def _chat(messages):
-    if not USE_GROQ:
+def _get_groq_client():
+    global groq_client, groq_client_key
+
+    api_key = os.environ.get("GROQ_API_KEY")
+    if not api_key:
+        try:
+            import streamlit as st
+
+            api_key = st.secrets.get("GROQ_API_KEY")
+        except StreamlitSecretNotFoundError:
+            api_key = None
+
+    if not api_key:
         raise RuntimeError(
             "The hosted LLM is not configured. Add GROQ_API_KEY to the app's secrets."
         )
-    response = groq_client.chat.completions.create(model=GROQ_MODEL, messages=messages)
+
+    if groq_client is None or groq_client_key != api_key:
+        groq_client = Groq(api_key=api_key)
+        groq_client_key = api_key
+    return groq_client
+
+def _chat(messages):
+    client = _get_groq_client()
+    response = client.chat.completions.create(model=GROQ_MODEL, messages=messages)
     return response.choices[0].message.content
 
 def _extract_document_text(file_bytes, extension):
